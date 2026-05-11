@@ -119,6 +119,165 @@ def train_mmd(model, src_loader, tgt_loader, M_phy, criterion, optimizer, scaler
             print(f"  MMD Epoch {epoch}/{epochs} | Loss: {total_loss / len(src_loader):.4f}")
 
 
+# ── CORAL (Deep CORAL) ──────────────────────────────────────────────
+
+def coral_loss(src_feats, tgt_feats):
+    """Deep CORAL: 对齐源域和目标域的协方差矩阵"""
+    d = src_feats.shape[1]
+    src_c = (src_feats.t() @ src_feats) / (src_feats.shape[0] - 1)
+    tgt_c = (tgt_feats.t() @ tgt_feats) / (tgt_feats.shape[0] - 1)
+    loss = (src_c - tgt_c).pow(2).sum() / (4 * d * d)
+    return loss
+
+
+def train_coral(model, src_loader, tgt_loader, M_phy, criterion, optimizer, scaler, device, epochs):
+    """CORAL 对齐训练"""
+    model.train()
+    for epoch in range(1, epochs + 1):
+        total_loss = 0
+        for (src_batch, tgt_batch) in zip(src_loader, tgt_loader):
+            src_x, src_y, _ = src_batch
+            tgt_x, _, _ = tgt_batch
+            src_x, src_y = src_x.to(device), src_y.to(device)
+            tgt_x = tgt_x.to(device)
+
+            optimizer.zero_grad()
+            with autocast(enabled=cfg.train.fp16):
+                src_logits, src_feats, src_attn = model(src_x, M_phy, return_features=True)
+                tgt_feats, _ = model.extract_features(tgt_x, M_phy)
+                cls_loss, _ = criterion(src_logits, src_y, features=src_feats,
+                                        attn_weights=src_attn, M_phy=M_phy)
+                loss = cls_loss + cfg.train.lambda_align * coral_loss(src_feats.float(), tgt_feats.float())
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+        if epoch % 10 == 0:
+            print(f"  CORAL Epoch {epoch}/{epochs} | Loss: {total_loss / len(src_loader):.4f}")
+
+
+# ── CDAN (Conditional Domain Adversarial Network) ──────────────────
+
+def train_cdan(model, src_loader, tgt_loader, M_phy, domain_disc, criterion,
+               optimizer, scaler, device, epochs):
+    """CDAN: 条件域对抗 (用softmax概率条件化)"""
+    from modules.selective_alignment import grad_reverse
+
+    model.train()
+    for epoch in range(1, epochs + 1):
+        total_loss = 0
+        for (src_batch, tgt_batch) in zip(src_loader, tgt_loader):
+            src_x, src_y, _ = src_batch
+            tgt_x, _, _ = tgt_batch
+            src_x, src_y = src_x.to(device), src_y.to(device)
+            tgt_x = tgt_x.to(device)
+
+            optimizer.zero_grad()
+            with autocast(enabled=cfg.train.fp16):
+                src_logits, src_feats, src_attn = model(src_x, M_phy, return_features=True)
+                tgt_logits, tgt_feats, _ = model(tgt_x, M_phy, return_features=True)
+
+                cls_loss, _ = criterion(src_logits, src_y, features=src_feats,
+                                        attn_weights=src_attn, M_phy=M_phy)
+
+                # 条件化: 拼接概率和特征 (简化版CDAN)
+                src_prob = F.softmax(src_logits.detach(), dim=1)  # (B, C)
+                tgt_prob = F.softmax(tgt_logits.detach(), dim=1)  # (B, C)
+                src_cond = torch.cat([src_prob, src_feats.float()], dim=1)  # (B, C+D)
+                tgt_cond = torch.cat([tgt_prob, tgt_feats.float()], dim=1)  # (B, C+D)
+
+                src_dom = domain_disc(grad_reverse(src_cond, 1.0))
+                tgt_dom = domain_disc(grad_reverse(tgt_cond, 1.0))
+                dom_loss = (F.binary_cross_entropy_with_logits(src_dom, torch.ones_like(src_dom)) +
+                            F.binary_cross_entropy_with_logits(tgt_dom, torch.zeros_like(tgt_dom))) * 0.5
+
+                loss = cls_loss + cfg.train.lambda_align * dom_loss
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+        if epoch % 10 == 0:
+            print(f"  CDAN Epoch {epoch}/{epochs} | Loss: {total_loss / len(src_loader):.4f}")
+
+
+# ── DSAN (Deep Subdomain Adaptation Network) ───────────────────────
+
+def train_dsan(model, src_loader, tgt_loader, M_phy, criterion, optimizer, scaler, device, epochs):
+    """DSAN: 子域自适应MMD (类条件MMD, 类似Ours但无选择性)"""
+    model.train()
+    for epoch in range(1, epochs + 1):
+        total_loss = 0
+        for (src_batch, tgt_batch) in zip(src_loader, tgt_loader):
+            src_x, src_y, _ = src_batch
+            tgt_x, _, _ = tgt_batch
+            src_x, src_y = src_x.to(device), src_y.to(device)
+            tgt_x = tgt_x.to(device)
+
+            optimizer.zero_grad()
+            with autocast(enabled=cfg.train.fp16):
+                src_logits, src_feats, src_attn = model(src_x, M_phy, return_features=True)
+                tgt_logits, tgt_feats, _ = model(tgt_x, M_phy, return_features=True)
+
+                cls_loss, _ = criterion(src_logits, src_y, features=src_feats,
+                                        attn_weights=src_attn, M_phy=M_phy)
+
+                # 类条件MMD (用源域真实标签 + 目标域伪标签)
+                tgt_pseudo = tgt_logits.argmax(dim=1)
+                lmm = torch.tensor(0.0, device=device)
+                for c in range(cfg.model.num_classes):
+                    s_mask = src_y == c
+                    t_mask = tgt_pseudo == c
+                    if s_mask.sum() > 1 and t_mask.sum() > 1:
+                        lmm += mmd_loss_rbf(src_feats[s_mask].float(), tgt_feats[t_mask].float())
+                lmm = lmm / cfg.model.num_classes
+
+                loss = cls_loss + cfg.train.lambda_align * lmm
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+        if epoch % 10 == 0:
+            print(f"  DSAN Epoch {epoch}/{epochs} | Loss: {total_loss / len(src_loader):.4f}")
+
+
+# ── MCD (Maximum Classifier Discrepancy) ───────────────────────────
+
+def train_mcd(model, src_loader, tgt_loader, M_phy, classifier2, criterion,
+              optimizer, scaler, device, epochs):
+    """MCD: 最大分类器差异 (两个分类器, 最小化源域差异, 最大化目标域差异)"""
+    model.train()
+    for epoch in range(1, epochs + 1):
+        total_loss = 0
+        for (src_batch, tgt_batch) in zip(src_loader, tgt_loader):
+            src_x, src_y, _ = src_batch
+            tgt_x, _, _ = tgt_batch
+            src_x, src_y = src_x.to(device), src_y.to(device)
+            tgt_x = tgt_x.to(device)
+
+            optimizer.zero_grad()
+            with autocast(enabled=cfg.train.fp16):
+                src_logits, src_feats, src_attn = model(src_x, M_phy, return_features=True)
+                tgt_feats, _ = model.extract_features(tgt_x, M_phy)
+
+                cls_loss, _ = criterion(src_logits, src_y, features=src_feats,
+                                        attn_weights=src_attn, M_phy=M_phy)
+
+                # 分类器2
+                tgt_logits1 = model.classifier(tgt_feats)
+                tgt_logits2 = classifier2(tgt_feats)
+
+                # 最大化目标域差异 (对抗)
+                discrepancy = -torch.mean(torch.abs(F.softmax(tgt_logits1, dim=1) - F.softmax(tgt_logits2, dim=1)))
+
+                loss = cls_loss + 0.1 * discrepancy
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+        if epoch % 10 == 0:
+            print(f"  MCD Epoch {epoch}/{epochs} | Loss: {total_loss / len(src_loader):.4f}")
+
+
 # ── OpenMax ────────────────────────────────────────────────────────
 
 def fit_openmax(model, loader, M_phy, device, tail_size=0.15):
@@ -201,7 +360,7 @@ def openmax_score(features, class_means, weibull_params, alpha=10):
 def run_closed_set_comparison(source_domain, target_domain, methods=None):
     """闭集跨域对比实验 (Table 4)"""
     if methods is None:
-        methods = ["Source Only", "DANN", "MMD", "Ours"]
+        methods = ["Source Only", "CORAL", "DANN", "CDAN", "DSAN", "MMD", "MCD", "Ours"]
 
     set_seed(cfg.train.seed)
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
@@ -317,6 +476,88 @@ def run_closed_set_comparison(source_domain, target_domain, methods=None):
             train_alignment(model, src_loader, tgt_loader, M_phy_dict, aligner, criterion,
                             optimizer2, scaler2, device, epochs=50, feature_dim=cfg.model.feature_dim)
 
+        elif method == "CORAL":
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+            scaler = GradScaler(enabled=cfg.train.fp16)
+            model.train()
+            for epoch in range(1, 31):
+                for x, y, _ in src_loader:
+                    x, y = x.to(device), y.to(device)
+                    optimizer.zero_grad()
+                    with autocast(enabled=cfg.train.fp16):
+                        logits, feats, attn = model(x, M_phy, return_features=True)
+                        loss, _ = criterion(logits, y, features=feats, attn_weights=attn, M_phy=M_phy)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+            optimizer2 = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr * 0.1, weight_decay=cfg.train.weight_decay)
+            scaler2 = GradScaler(enabled=cfg.train.fp16)
+            train_coral(model, src_loader, tgt_loader, M_phy, criterion, optimizer2, scaler2, device, epochs=50)
+
+        elif method == "CDAN":
+            from torch import nn
+            # CDAN域判别器: 概率+特征维度 → 1
+            cond_dim = cfg.model.num_classes + cfg.model.feature_dim
+            domain_disc = nn.Sequential(nn.Linear(cond_dim, 256), nn.ReLU(), nn.Linear(256, 1)).to(device)
+            all_params = list(model.parameters()) + list(domain_disc.parameters())
+            optimizer = torch.optim.AdamW(all_params, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+            scaler = GradScaler(enabled=cfg.train.fp16)
+            model.train()
+            for epoch in range(1, 31):
+                for x, y, _ in src_loader:
+                    x, y = x.to(device), y.to(device)
+                    optimizer.zero_grad()
+                    with autocast(enabled=cfg.train.fp16):
+                        logits, feats, attn = model(x, M_phy, return_features=True)
+                        loss, _ = criterion(logits, y, features=feats, attn_weights=attn, M_phy=M_phy)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+            optimizer2 = torch.optim.AdamW(all_params, lr=cfg.train.lr * 0.1, weight_decay=cfg.train.weight_decay)
+            scaler2 = GradScaler(enabled=cfg.train.fp16)
+            train_cdan(model, src_loader, tgt_loader, M_phy, domain_disc, criterion,
+                       optimizer2, scaler2, device, epochs=50)
+
+        elif method == "DSAN":
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+            scaler = GradScaler(enabled=cfg.train.fp16)
+            model.train()
+            for epoch in range(1, 31):
+                for x, y, _ in src_loader:
+                    x, y = x.to(device), y.to(device)
+                    optimizer.zero_grad()
+                    with autocast(enabled=cfg.train.fp16):
+                        logits, feats, attn = model(x, M_phy, return_features=True)
+                        loss, _ = criterion(logits, y, features=feats, attn_weights=attn, M_phy=M_phy)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+            optimizer2 = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr * 0.1, weight_decay=cfg.train.weight_decay)
+            scaler2 = GradScaler(enabled=cfg.train.fp16)
+            train_dsan(model, src_loader, tgt_loader, M_phy, criterion, optimizer2, scaler2, device, epochs=50)
+
+        elif method == "MCD":
+            from torch import nn
+            classifier2 = nn.Linear(cfg.model.feature_dim, cfg.model.num_classes).to(device)
+            all_params = list(model.parameters()) + list(classifier2.parameters())
+            optimizer = torch.optim.AdamW(all_params, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+            scaler = GradScaler(enabled=cfg.train.fp16)
+            model.train()
+            for epoch in range(1, 31):
+                for x, y, _ in src_loader:
+                    x, y = x.to(device), y.to(device)
+                    optimizer.zero_grad()
+                    with autocast(enabled=cfg.train.fp16):
+                        logits, feats, attn = model(x, M_phy, return_features=True)
+                        loss, _ = criterion(logits, y, features=feats, attn_weights=attn, M_phy=M_phy)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+            optimizer2 = torch.optim.AdamW(all_params, lr=cfg.train.lr * 0.1, weight_decay=cfg.train.weight_decay)
+            scaler2 = GradScaler(enabled=cfg.train.fp16)
+            train_mcd(model, src_loader, tgt_loader, M_phy, classifier2, criterion,
+                      optimizer2, scaler2, device, epochs=50)
+
         # 评估
         model.eval()
         preds, trues = [], []
@@ -337,7 +578,7 @@ def run_closed_set_comparison(source_domain, target_domain, methods=None):
 def run_openset_comparison(source_domain, target_domain, unknown_class, methods=None):
     """开集诊断对比实验 (Table 5)"""
     if methods is None:
-        methods = ["Source Only", "DANN + Energy", "OpenMax", "Ours"]
+        methods = ["Source Only", "DANN + Energy", "OpenMax", "Proto", "OSBP", "Ours"]
 
     set_seed(cfg.train.seed)
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
@@ -426,6 +667,63 @@ def run_openset_comparison(source_domain, target_domain, unknown_class, methods=
                     scaler.step(optimizer)
                     scaler.update()
 
+        elif method == "Proto":
+            # Prototype Distance: 源域预训练, 用特征距离做开集检测
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+            scaler = GradScaler(enabled=cfg.train.fp16)
+            model.train()
+            for epoch in range(1, 81):
+                for x, y, _ in src_loader:
+                    x, y = x.to(device), y.to(device)
+                    optimizer.zero_grad()
+                    with autocast(enabled=cfg.train.fp16):
+                        logits, feats, attn = model(x, M_phy, return_features=True)
+                        loss, _ = criterion(logits, y, features=feats, attn_weights=attn, M_phy=M_phy)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+
+        elif method == "OSBP":
+            # OSBP: 将未知类作为额外类训练
+            from torch import nn
+            cfg_bak = cfg.model.num_classes
+            cfg.model.num_classes = K + 1  # 增加unknown类
+
+            model_osbp = FullModel(cfg).to(device)
+            criterion_osbp = CombinedLoss(cfg)
+            optimizer = torch.optim.AdamW(model_osbp.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+            scaler = GradScaler(enabled=cfg.train.fp16)
+
+            model_osbp.train()
+            for epoch in range(1, 81):
+                for (src_batch, tgt_batch) in zip(src_loader, tgt_loader):
+                    src_x, src_y, _ = src_batch
+                    tgt_x, _, _ = tgt_batch
+                    src_x, src_y = src_x.to(device), src_y.to(device)
+                    tgt_x = tgt_x.to(device)
+
+                    optimizer.zero_grad()
+                    with autocast(enabled=cfg.train.fp16):
+                        src_logits, src_feats, src_attn = model_osbp(src_x, M_phy, return_features=True)
+                        tgt_logits, _ = model_osbp(tgt_x, M_phy)
+
+                        cls_loss, _ = criterion_osbp(src_logits, src_y, features=src_feats,
+                                                      attn_weights=src_attn, M_phy=M_phy)
+
+                        # OSBP: 目标域用熵最小化 + unknown类鼓励
+                        tgt_prob = F.softmax(tgt_logits, dim=1)
+                        entropy = -(tgt_prob * torch.log(tgt_prob + 1e-8)).sum(dim=1).mean()
+                        # 鼓励目标域预测为unknown类(最后一个类)
+                        unk_prob = tgt_prob[:, -1].mean()
+                        loss = cls_loss + 0.1 * entropy - 0.1 * unk_prob
+
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+
+            model = model_osbp
+            cfg.model.num_classes = cfg_bak
+
         elif method == "Ours":
             from modules import SelectiveDomainAligner
             optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
@@ -454,7 +752,90 @@ def run_openset_comparison(source_domain, target_domain, unknown_class, methods=
         # 评估
         model.eval()
 
-        if method == "OpenMax":
+        if method == "Proto":
+            # Prototype Distance: 用源域原型距离做开集检测
+            src_feats_list, src_labels_list = [], []
+            with torch.no_grad():
+                for x, y, _ in src_loader:
+                    x = x.to(device)
+                    f, _ = model.extract_features(x, M_phy)
+                    src_feats_list.append(f.cpu())
+                    src_labels_list.append(y)
+            src_feats = torch.cat(src_feats_list, 0)
+            src_labels = torch.cat(src_labels_list, 0)
+
+            # 类原型
+            prototypes = []
+            for c in range(K):
+                mask = src_labels == c
+                prototypes.append(src_feats[mask].mean(dim=0))
+            prototypes = torch.stack(prototypes)
+
+            # 目标域
+            tgt_feats_list, tgt_logits_list, tgt_true_list = [], [], []
+            with torch.no_grad():
+                for x, y, _ in tgt_loader:
+                    x = x.to(device)
+                    f, _ = model.extract_features(x, M_phy)
+                    lg, _ = model(x, M_phy)
+                    tgt_feats_list.append(f.cpu())
+                    tgt_logits_list.append(lg.cpu())
+                    tgt_true_list.append(y)
+            tgt_feats = torch.cat(tgt_feats_list, 0)
+            tgt_logits = torch.cat(tgt_logits_list, 0)
+            tgt_true = torch.cat(tgt_true_list, 0)
+
+            # 原型距离作为未知分数
+            dists = torch.cdist(tgt_feats, prototypes, p=2)
+            min_dists = dists.min(dim=1)[0].numpy()
+            tgt_preds = tgt_logits.argmax(dim=1).numpy()
+
+            true_labels = np.array([-1 if int(l) == unknown_orig else label_map.get(int(l), -1)
+                                    for l in tgt_true.numpy()])
+
+            best_h, best_result = 0, None
+            for pct in range(1, 100, 2):
+                thresh = np.percentile(min_dists, 100 - pct)
+                p = tgt_preds.copy()
+                p[min_dists > thresh] = -1
+                m = compute_open_set_metrics(true_labels, p, min_dists)
+                if m["h_score"] > best_h:
+                    best_h = m["h_score"]
+                    best_result = m
+            m = best_result
+
+        elif method == "OSBP":
+            # OSBP: 前K个类为已知, 最后一个类为unknown
+            tgt_logits, tgt_true = [], []
+            with torch.no_grad():
+                for x, y, _ in tgt_loader:
+                    x = x.to(device)
+                    logits, _ = model(x, M_phy)
+                    tgt_logits.append(logits.cpu())
+                    tgt_true.append(y)
+            tgt_logits = torch.cat(tgt_logits, 0)
+            tgt_true = torch.cat(tgt_true, 0)
+
+            # 已知类概率 = 前K个类的softmax之和, unknown概率 = 最后一个类
+            prob_k = F.softmax(tgt_logits[:, :K], dim=1)
+            unk_score = F.softmax(tgt_logits, dim=1)[:, -1].numpy()
+            tgt_preds = prob_k.argmax(dim=1).numpy()
+
+            true_labels = np.array([-1 if int(l) == unknown_orig else label_map.get(int(l), -1)
+                                    for l in tgt_true.numpy()])
+
+            best_h, best_result = 0, None
+            for pct in range(1, 100, 2):
+                thresh = np.percentile(unk_score, 100 - pct)
+                p = tgt_preds.copy()
+                p[unk_score > thresh] = -1
+                m = compute_open_set_metrics(true_labels, p, unk_score)
+                if m["h_score"] > best_h:
+                    best_h = m["h_score"]
+                    best_result = m
+            m = best_result
+
+        elif method == "OpenMax":
             # OpenMax 评估
             class_means, weibull_params = fit_openmax(model, src_loader, M_phy, device)
 
@@ -545,9 +926,10 @@ if __name__ == "__main__":
     parser.add_argument("--source", default="W1")
     parser.add_argument("--target", default="W2")
     parser.add_argument("--unknown", default="Ball")
+    parser.add_argument("--methods", nargs="+", default=None)
     args = parser.parse_args()
 
     if args.task == "closed_set":
-        results = run_closed_set_comparison(args.source, args.target)
+        results = run_closed_set_comparison(args.source, args.target, methods=args.methods)
     else:
-        results = run_openset_comparison(args.source, args.target, args.unknown)
+        results = run_openset_comparison(args.source, args.target, args.unknown, methods=args.methods)

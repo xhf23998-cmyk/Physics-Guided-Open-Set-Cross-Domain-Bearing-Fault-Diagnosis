@@ -389,10 +389,12 @@ def main():
     for key, val in all_results.items():
         print(f"\n{key}:")
         if isinstance(val, dict):
-            for method, m in val.items():
-                print(f"  {method}: Acc={m['accuracy']:.4f}, F1={m['macro_f1']:.4f}")
-        elif isinstance(val, dict) and "accuracy" in val:
-            print(f"  Acc={val['accuracy']:.4f}, F1={val['macro_f1']:.4f}")
+            if "accuracy" in val:
+                print(f"  Acc={val['accuracy']:.4f}, F1={val['macro_f1']:.4f}")
+            else:
+                for method, m in val.items():
+                    if isinstance(m, dict) and "accuracy" in m:
+                        print(f"  {method}: Acc={m['accuracy']:.4f}, F1={m['macro_f1']:.4f}")
 
     return all_results
 

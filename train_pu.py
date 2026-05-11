@@ -49,42 +49,45 @@ class PUTensorDataset(Dataset):
 def _load_pu_signal(fpath):
     """从单个 PU .mat 文件加载振动信号
 
-    PU .mat 结构: X 有3个通道
-      Ch0: 振动信号 (加速度计, ~16000点, 64kHz, ~0.25s)
-      Ch1: 电机电流 (~256000点)
-      Ch2: 元数据 (5点)
-    选择 Ch0 (振动通道), 而不是最长通道(电流)
+    PU数据结构: X字段=时间基准, Y字段=实际测量(vibration_1等)
     """
     from scipy.io import loadmat
-    mat = loadmat(fpath)
+    from scipy.signal import detrend as _detrend
+    try:
+        mat = loadmat(fpath)
+    except Exception:
+        return None
     for key in mat:
         if key.startswith("__"):
             continue
         val = mat[key]
         if not isinstance(val, np.ndarray):
             continue
+        if val.dtype.names and "Y" in val.dtype.names:
+            rec = val[0, 0]
+            Y = rec["Y"]
+            best_signal, best_len = None, 0
+            for i in range(Y.shape[1]):
+                ch = Y[0, i]
+                if "Name" in ch.dtype.names and "Data" in ch.dtype.names:
+                    name = str(ch["Name"].flatten()[0]) if ch["Name"].size > 0 else ""
+                    data = ch["Data"].flatten().astype(np.float32)
+                    if "vibration" in name.lower():
+                        return _detrend(data)
+                    if len(data) > best_len and data.std() > 1e-6:
+                        best_signal = data
+                        best_len = len(data)
+            if best_signal is not None:
+                return _detrend(best_signal)
         if val.dtype.names and "X" in val.dtype.names:
             rec = val[0, 0]
             X = rec["X"]
-            # 优先选择振动通道 (Ch0, ~16000点)
-            # 跳过过短的通道 (<1000点)
             for i in range(X.shape[1]):
                 ch = X[0, i]
                 if "Data" in ch.dtype.names:
-                    sig = ch["Data"].flatten()
-                    if 1000 < len(sig) < 100000:  # 振动通道长度范围
-                        return sig.astype(np.float32)
-            # 回退: 选择最短的有效通道
-            valid = []
-            for i in range(X.shape[1]):
-                ch = X[0, i]
-                if "Data" in ch.dtype.names:
-                    sig = ch["Data"].flatten()
-                    if len(sig) > 1000:
-                        valid.append((len(sig), sig))
-            if valid:
-                valid.sort(key=lambda x: x[0])
-                return valid[0][1].astype(np.float32)
+                    data = ch["Data"].flatten().astype(np.float32)
+                    if data.std() > 1e-6:
+                        return _detrend(data)
         if val.size > 100:
             return val.flatten().astype(np.float32)
     return None
